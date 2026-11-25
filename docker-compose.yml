@@ -1,0 +1,11 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sazon_ya_frontend
+    restart: unless-stopped
+    environment:
+      FRONTEND_PORT: 5173
+    ports:
+      - "5173:5173"
