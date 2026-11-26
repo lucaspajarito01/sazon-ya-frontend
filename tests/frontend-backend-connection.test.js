@@ -128,6 +128,21 @@ describe('Conexión E2E Frontend (HTML5/CSS3/Vanilla JS) <-> Backend API REST', 
     });
     assert.equal(createProdRes.data.product.estado, 'DISPONIBLE');
 
+    // Cambio de estado de evento con valores válidos del backend (CANCELADO / ACTIVO)
+    const cancelEvRes = await apiRequest('/events/1/status', {
+      method: 'PATCH',
+      baseUrl,
+      body: { estado: 'CANCELADO' }
+    });
+    assert.equal(cancelEvRes.data.event.estado, 'CANCELADO');
+
+    const reactivateEvRes = await apiRequest('/events/1/status', {
+      method: 'PATCH',
+      baseUrl,
+      body: { estado: 'ACTIVO' }
+    });
+    assert.equal(reactivateEvRes.data.event.estado, 'ACTIVO');
+
     // Utilidades UI del Frontend
     const svgUri = buildSvgDataUri('Papas Bravas SazónYA');
     assert.ok(svgUri.startsWith('data:image/svg+xml;utf8,'));
