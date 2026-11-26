@@ -8,7 +8,8 @@ import {
   isAdmin,
   onSessionChange
 } from './session.js';
-import { apiRequest } from './api.js';
+import { apiRequest, resolveAssetUrl } from './api.js';
+import { mountInteractiveBurger, BURGER_LAYERS } from './burger.js';
 import {
   el,
   clearContainer,
@@ -19,14 +20,16 @@ import {
   animatePulse,
   animateCounter,
   showNotification,
-  applyFormErrors
+  applyFormErrors,
+  createWeeklyLineChart,
+  renderCardlessEventsShowcase
 } from './ui.js';
 
 const appState = {
-  route: 'home',
+  route: null,
+  homeTab: 'all',
   userTab: 'pedidos',
   adminTab: 'estadisticas',
-  selectedCategory: '',
   products: [],
   categories: [],
   condiments: [],
@@ -37,8 +40,41 @@ const appState = {
   myOrders: [],
   weeklyStats: null,
   cart: [],
-  editingProduct: null
+  editingProduct: null,
+  editingEvent: null
 };
+
+let activeBurgerController = null;
+let navToggleWired = false;
+let homeTabSyncHandler = null;
+let activeProductPreviewUrl = null;
+let activeEventPreviewUrl = null;
+
+function revokeProductPreviewUrl() {
+  if (activeProductPreviewUrl) {
+    URL.revokeObjectURL(activeProductPreviewUrl);
+    activeProductPreviewUrl = null;
+  }
+}
+
+function revokeEventPreviewUrl() {
+  if (activeEventPreviewUrl) {
+    URL.revokeObjectURL(activeEventPreviewUrl);
+    activeEventPreviewUrl = null;
+  }
+}
+
+function revokeAllAdminPreviewUrls() {
+  revokeProductPreviewUrl();
+  revokeEventPreviewUrl();
+}
+
+function closeMobileNav() {
+  const nav = document.getElementById('nav-actions');
+  const toggle = document.getElementById('nav-toggle');
+  if (nav) nav.classList.remove('is-open');
+  if (toggle) toggle.setAttribute('aria-expanded', 'false');
+}
 
 function navigate(route) {
   window.location.hash = `#${route}`;
@@ -46,14 +82,23 @@ function navigate(route) {
 
 function renderNavbar() {
   const nav = document.getElementById('nav-actions');
+  const toggle = document.getElementById('nav-toggle');
   if (!nav) return;
   clearContainer(nav);
 
+  if (toggle && !navToggleWired) {
+    navToggleWired = true;
+    toggle.addEventListener('click', () => {
+      const open = nav.classList.toggle('is-open');
+      toggle.setAttribute('aria-expanded', String(open));
+    });
+  }
+
   const links = [
-    { label: 'Vista General', hash: '#home' },
-    { label: '¿Quiénes Somos?', hash: '#quienes-somos' },
-    { label: 'Productos', hash: '#catalogo' },
+    { label: 'Inicio', hash: '#home' },
+    { label: 'Menú', hash: '#catalogo' },
     { label: 'Eventos', hash: '#eventos' },
+    { label: 'Nosotros', hash: '#quienes-somos' },
     { label: 'Contacto', hash: '#contacto' }
   ];
 
@@ -63,7 +108,8 @@ function renderNavbar() {
         'a',
         {
           href: item.hash,
-          className: `nav-link ${appState.route === 'home' && item.hash === '#home' ? 'active' : ''}`
+          className: `nav-link ${appState.route === 'home' && item.hash === '#home' ? 'active' : ''}`,
+          onClick: () => closeMobileNav()
         },
         item.label
       )
@@ -72,28 +118,29 @@ function renderNavbar() {
 
   if (!isAuthenticated()) {
     nav.appendChild(
-      el('a', { href: '#login', className: 'btn btn-outline' }, 'Iniciar Sesión')
+      el('a', { href: '#login', className: 'btn btn-outline btn-sm', onClick: () => closeMobileNav() }, 'Iniciar Sesión')
     );
     nav.appendChild(
-      el('a', { href: '#register', className: 'btn btn-primary' }, 'Registrarse')
+      el('a', { href: '#register', className: 'btn btn-primary btn-sm', onClick: () => closeMobileNav() }, 'Registrarse')
     );
   } else {
     if (isAdmin()) {
       nav.appendChild(
-        el('a', { href: '#admin', className: 'btn btn-secondary' }, 'Panel Admin')
+        el('a', { href: '#admin', className: 'btn btn-secondary btn-sm', onClick: () => closeMobileNav() }, 'Panel Admin')
       );
     }
     const firstName = (sessionState.user?.nombre || 'Cliente').split(' ')[0];
     nav.appendChild(
-      el('a', { href: '#portal', className: 'btn btn-primary' }, `Mi Portal (${firstName})`)
+      el('a', { href: '#portal', className: 'btn btn-primary btn-sm', onClick: () => closeMobileNav() }, `Mi Portal (${firstName})`)
     );
     nav.appendChild(
       el(
         'button',
         {
           type: 'button',
-          className: 'btn btn-outline',
+          className: 'btn btn-outline btn-sm',
           onClick: () => {
+            closeMobileNav();
             clearSession();
             showNotification('Sesión cerrada correctamente.', 'success');
             navigate('login');
@@ -106,203 +153,377 @@ function renderNavbar() {
 }
 
 /* ==========================================================================
-   1. VISTA GENERAL PÚBLICA (¿Quiénes somos?, Productos, Eventos, Contacto)
+   1. VISTA GENERAL PÚBLICA (Hero Minimalista + Hamburguesa, Menú, Eventos, Contacto)
    ========================================================================== */
+const HOME_TABS = [
+  { key: 'all', label: 'Todo' },
+  { key: 'hamburguesas', label: 'Hamburguesas' },
+  { key: 'acompanamientos', label: 'Acompañamientos' },
+  { key: 'bebidas', label: 'Bebidas' },
+  { key: 'eventos', label: 'Eventos' }
+];
+
+function filterProductsByHomeTab(products = [], categories = [], tabKey = 'all') {
+  if (tabKey === 'all') return products;
+  const catNameById = new Map(categories.map((c) => [Number(c.id), String(c.nombre || '').toLowerCase()]));
+
+  return products.filter((prod) => {
+    const catId = Number(prod.categoria_id);
+    const catName = catNameById.get(catId) || '';
+    if (tabKey === 'hamburguesas') {
+      return catName.includes('hamburguesa') || catName.includes('combo') || catId === 1 || catId === 3;
+    }
+    if (tabKey === 'acompanamientos') {
+      return catName.includes('papas') || catName.includes('acompañ') || catId === 2;
+    }
+    if (tabKey === 'bebidas') {
+      return catName.includes('bebida') || catName.includes('malteada') || catId === 4;
+    }
+    return true;
+  });
+}
+
 async function renderHomeView(root) {
+  activeBurgerController?.destroy();
+  activeBurgerController = null;
   clearContainer(root);
   const about = CONFIG.ABOUT_INFO;
 
-  const heroCtaGroup = el('div', { style: { display: 'flex', gap: '0.85rem', flexWrap: 'wrap' } }, [
-    el('a', { href: '#catalogo', className: 'btn btn-primary' }, 'Ver Menú & Precios'),
-    el('a', { href: '#eventos', className: 'btn btn-secondary' }, 'Eventos y Promociones'),
-    !isAuthenticated()
-      ? el(
-          'a',
-          {
-            href: '#login',
-            className: 'btn btn-outline',
-            style: { color: '#fff', borderColor: 'rgba(255,255,255,0.4)' }
-          },
-          'Iniciar Sesión / Registrarse'
-        )
-      : isAdmin()
-        ? el('a', { href: '#admin', className: 'btn btn-secondary' }, 'Ir al Panel Administrador')
-        : el('a', { href: '#portal', className: 'btn btn-secondary' }, 'Ir a Mi Portal de Pedidos y Sorteos')
-  ]);
+  const burgerMount = el('div', { id: 'hero-burger-mount' });
+  const segmentBtns = BURGER_LAYERS.map((layer, idx) =>
+    el('button', {
+      type: 'button',
+      className: 'hero-segment',
+      'aria-label': `Capa ${idx + 1}: ${layer.name}`,
+      'aria-pressed': 'false'
+    })
+  );
+  const toggleBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'hero-toggle-btn',
+      'aria-pressed': 'false',
+      'aria-label': 'Separar capas de la hamburguesa'
+    },
+    '‖'
+  );
 
-  const hero = el('div', { className: 'hero' }, [
-    el('div', { style: { maxWidth: '740px' } }, [
-      el(
-        'span',
-        {
-          className: 'badge badge-ACTIVO',
-          style: { background: '#FFB703', color: '#1D1E22', marginBottom: '0.9rem' }
-        },
-        'PARRILLA URBANA & COMIDA RÁPIDA'
-      ),
-      el('h1', {}, 'SazónYA: Hamburguesas a la Brasa, Papas Rústicas y Sabor Real'),
-      el(
-        'p',
-        { style: { fontSize: '1.06rem', opacity: '0.92', marginBottom: '1.35rem' } },
-        about.mision
-      ),
-      heroCtaGroup
+  const hero = el('section', { className: 'hero', 'aria-label': 'Presentación principal SazónYA' }, [
+    el('div', { className: 'hero-stage' }, [
+      el('div', { className: 'hero-visual' }, [burgerMount]),
+      el('div', { className: 'hero-copy' }, [
+        el('h1', { className: 'hero-title' }, ['Sazón a la brasa', el('br'), 'en cada capa']),
+        el('p', { className: 'hero-subtitle' }, 'Explora nuestra burger artesanal capa por capa.'),
+        el('a', { href: '#catalogo', className: 'btn hero-cta' }, 'Explorar menú')
+      ])
+    ]),
+    el('div', { className: 'hero-controls' }, [
+      el('div', { className: 'hero-segments' }, segmentBtns),
+      toggleBtn
     ])
   ]);
 
-  const aboutSection = el(
-    'section',
-    { id: 'quienes-somos', className: 'card', style: { marginBottom: '2.2rem' } },
+  const productsGrid = el('div', { className: 'grid-3', id: 'home-products-grid' });
+  const eventsTabPanel = el(
+    'div',
+    {
+      id: 'home-events-tab-panel',
+      className: 'home-events-tab-panel',
+      role: 'tabpanel',
+      hidden: 'true'
+    },
     [
-      el('div', { className: 'card-body' }, [
-        el('h2', { style: { color: 'var(--color-primary)' } }, '¿Quiénes Somos?'),
-        el('p', {}, about.historia),
-        el('div', { className: 'grid-3', style: { marginTop: '0.6rem' } }, [
-          el(
-            'div',
-            {
-              style: {
-                padding: '0.95rem',
-                background: 'var(--bg-main)',
-                borderRadius: '12px',
-                border: '1px solid var(--border-subtle)'
-              }
-            },
-            [
-              el('h4', { style: { color: 'var(--color-accent)' } }, '100% Carne de Res & Pan Brioche'),
-              el(
-                'p',
-                { style: { fontSize: '0.9rem', color: 'var(--text-muted)' } },
-                'Ingredientes controlados en nuestro sistema de inventario de productos y condimentos en tiempo real.'
-              )
-            ]
-          ),
-          el(
-            'div',
-            {
-              style: {
-                padding: '0.95rem',
-                background: 'var(--bg-main)',
-                borderRadius: '12px',
-                border: '1px solid var(--border-subtle)'
-              }
-            },
-            [
-              el('h4', { style: { color: 'var(--color-primary)' } }, 'Comunidad & Reseñas Reales'),
-              el(
-                'p',
-                { style: { fontSize: '0.9rem', color: 'var(--text-muted)' } },
-                'Nuestros clientes califican con estrellas cada hamburguesa y recomiendan nuevos productos del menú.'
-              )
-            ]
-          ),
-          el(
-            'div',
-            {
-              style: {
-                padding: '0.95rem',
-                background: 'var(--bg-main)',
-                borderRadius: '12px',
-                border: '1px solid var(--border-subtle)'
-              }
-            },
-            [
-              el('h4', { style: { color: 'var(--status-success)' } }, 'Eventos & Sorteos Mensuales'),
-              el(
-                'p',
-                { style: { fontSize: '0.9rem', color: 'var(--text-muted)' } },
-                'Participa en promociones semanales y sorteos exclusivos organizados por la administración.'
-              )
-            ]
-          )
+      el(
+        'p',
+        { className: 'home-events-tab-note' },
+        'Explora nuestras promociones, sorteos y experiencias de temporada.'
+      ),
+      el(
+        'button',
+        {
+          type: 'button',
+          className: 'btn btn-primary btn-sm',
+          onClick: () => {
+            document.getElementById('eventos')?.scrollIntoView({ behavior: 'smooth' });
+          }
+        },
+        'Ir a la sección de Eventos'
+      )
+    ]
+  );
+  const tabButtons = [];
+
+  function syncHomeTabs(activeKey) {
+    appState.homeTab = activeKey;
+    for (const { key, btn } of tabButtons) {
+      const selected = key === activeKey;
+      btn.classList.toggle('active', selected);
+      btn.setAttribute('aria-selected', String(selected));
+    }
+    if (activeKey === 'eventos') {
+      productsGrid.hidden = true;
+      eventsTabPanel.hidden = false;
+    } else {
+      productsGrid.hidden = false;
+      eventsTabPanel.hidden = true;
+      populateHomeProducts(productsGrid);
+    }
+  }
+  homeTabSyncHandler = syncHomeTabs;
+
+  const tabBar = el('div', { className: 'tab-bar', role: 'tablist', 'aria-label': 'Categorías del menú' });
+  for (const t of HOME_TABS) {
+    const selected = appState.homeTab === t.key;
+    const btn = el(
+      'button',
+      {
+        type: 'button',
+        role: 'tab',
+        className: `tab-btn${selected ? ' active' : ''}`,
+        'aria-selected': String(selected),
+        onClick: () => syncHomeTabs(t.key)
+      },
+      t.label
+    );
+    tabButtons.push({ key: t.key, btn });
+    tabBar.appendChild(btn);
+  }
+
+  const catalogSection = el('section', { id: 'catalogo', className: 'showcase-section' }, [
+    el('div', { className: 'showcase-header' }, [
+      el('h2', { className: 'showcase-heading' }, 'Explora nuestras especialidades'),
+      el(
+        'button',
+        {
+          type: 'button',
+          className: 'showcase-link',
+          onClick: () => {
+            syncHomeTabs('all');
+            productsGrid.scrollIntoView({ behavior: 'smooth' });
+          }
+        },
+        'Ver todo el menú'
+      )
+    ]),
+    tabBar,
+    productsGrid,
+    eventsTabPanel
+  ]);
+
+  const eventsHost = el('div', { id: 'home-events-showcase' });
+  const eventsSection = el('section', { id: 'eventos', className: 'showcase-section' }, [
+    el('div', { style: { marginBottom: '1rem' } }, [
+      el('h2', {}, 'Eventos y Promociones'),
+      el('p', { style: { color: 'var(--text-muted)', fontSize: '0.92rem' } }, 'Activaciones, videos y sorteos vigentes.')
+    ]),
+    eventsHost
+  ]);
+
+  const aboutSection = el('section', { id: 'quienes-somos', className: 'about-strip' }, [
+    el('div', { className: 'about-strip-header' }, [
+      el('h2', { style: { color: 'var(--color-primary)' } }, 'Nuestra esencia'),
+      el('p', { style: { color: 'var(--text-muted)', fontSize: '0.92rem', maxWidth: '620px' } }, about.historia)
+    ]),
+    el('div', { className: 'about-pillars' }, [
+      el('div', { className: 'about-pillar' }, [
+        el('h4', { style: { color: 'var(--color-accent)' } }, '100% Brasa'),
+        el('p', {}, 'Pan brioche diario y carne sellada al carbón.')
+      ]),
+      el('div', { className: 'about-pillar' }, [
+        el('h4', { style: { color: 'var(--color-primary)' } }, 'Reseñas Reales'),
+        el('p', {}, 'Calificaciones verificadas de nuestra comunidad.')
+      ]),
+      el('div', { className: 'about-pillar' }, [
+        el('h4', { style: { color: 'var(--status-success)' } }, 'Eventos Activos'),
+        el('p', {}, 'Promociones semanales y sorteos con boleto digital.')
+      ])
+    ])
+  ]);
+
+  // Sección HTML dedicada de Contacto (Distribución no lineal + Formulario conectado a POST /api/v1/contacts)
+  const contactNombre = el('input', {
+    id: 'contact-nombre',
+    name: 'nombre',
+    type: 'text',
+    className: 'form-control',
+    placeholder: 'Tu nombre',
+    'aria-invalid': 'false',
+    required: 'true'
+  });
+  const contactCorreo = el('input', {
+    id: 'contact-correo',
+    name: 'correo',
+    type: 'email',
+    className: 'form-control',
+    placeholder: 'tu@correo.com',
+    'aria-invalid': 'false',
+    required: 'true'
+  });
+  const contactAsunto = el('input', {
+    id: 'contact-asunto',
+    name: 'asunto',
+    type: 'text',
+    className: 'form-control',
+    placeholder: 'Reserva, evento o consulta',
+    'aria-invalid': 'false',
+    required: 'true'
+  });
+  const contactMensaje = el('textarea', {
+    id: 'contact-mensaje',
+    name: 'mensaje',
+    rows: '3',
+    className: 'form-control',
+    placeholder: 'Cuéntanos en qué podemos ayudarte...',
+    'aria-invalid': 'false',
+    required: 'true'
+  });
+  const contactStatus = el('div', {
+    id: 'contact-status',
+    role: 'status',
+    'aria-live': 'polite'
+  });
+  const contactSubmitBtn = el('button', { type: 'submit', className: 'btn btn-primary' }, 'Enviar Mensaje');
+
+  const contactForm = el(
+    'form',
+    {
+      id: 'contact-form',
+      novalidate: 'true',
+      onSubmit: async (e) => {
+        e.preventDefault();
+        applyFormErrors(contactForm, []);
+        clearContainer(contactStatus);
+
+        const nombre = contactNombre.value.trim();
+        const correo = contactCorreo.value.trim();
+        const asunto = contactAsunto.value.trim();
+        const mensaje = contactMensaje.value.trim();
+
+        const localErrors = [];
+        if (nombre.length < 2) {
+          localErrors.push({ field: 'nombre', message: 'Ingresa tu nombre (mínimo 2 caracteres).' });
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+          localErrors.push({ field: 'correo', message: 'Ingresa un correo electrónico válido.' });
+        }
+        if (asunto.length < 3) {
+          localErrors.push({ field: 'asunto', message: 'El asunto debe tener al menos 3 caracteres.' });
+        }
+        if (mensaje.length < 10) {
+          localErrors.push({ field: 'mensaje', message: 'El mensaje debe tener al menos 10 caracteres.' });
+        }
+        if (localErrors.length > 0) {
+          applyFormErrors(contactForm, localErrors);
+          return;
+        }
+
+        contactSubmitBtn.disabled = true;
+        contactSubmitBtn.textContent = 'Enviando...';
+        try {
+          const res = await apiRequest('/contacts', {
+            method: 'POST',
+            body: { nombre, correo, asunto, mensaje }
+          });
+          contactForm.reset();
+          applyFormErrors(contactForm, []);
+          contactStatus.appendChild(
+            el('div', { className: 'status-banner success', style: { margin: '0.5rem 0 0' } }, [
+              el('span', {}, res.message || 'Mensaje enviado. Te responderemos pronto.')
+            ])
+          );
+        } catch (err) {
+          applyFormErrors(contactForm, err.errors || []);
+          contactStatus.appendChild(
+            el('div', { className: 'status-banner error', style: { margin: '0.5rem 0 0' } }, [
+              el('span', {}, err.message || 'No se pudo enviar el mensaje.')
+            ])
+          );
+        } finally {
+          contactSubmitBtn.disabled = false;
+          contactSubmitBtn.textContent = 'Enviar Mensaje';
+        }
+      }
+    },
+    [
+      el('div', { className: 'form-row-2' }, [
+        el('div', { className: 'form-group' }, [
+          el('label', { className: 'form-label', for: 'contact-nombre' }, 'Nombre'),
+          contactNombre,
+          el('span', { className: 'field-error', 'data-error-for': 'nombre' })
+        ]),
+        el('div', { className: 'form-group' }, [
+          el('label', { className: 'form-label', for: 'contact-correo' }, 'Correo'),
+          contactCorreo,
+          el('span', { className: 'field-error', 'data-error-for': 'correo' })
+        ])
+      ]),
+      el('div', { className: 'form-group' }, [
+        el('label', { className: 'form-label', for: 'contact-asunto' }, 'Asunto'),
+        contactAsunto,
+        el('span', { className: 'field-error', 'data-error-for': 'asunto' })
+      ]),
+      el('div', { className: 'form-group' }, [
+        el('label', { className: 'form-label', for: 'contact-mensaje' }, 'Mensaje'),
+        contactMensaje,
+        el('span', { className: 'field-error', 'data-error-for': 'mensaje' })
+      ]),
+      contactSubmitBtn,
+      contactStatus
+    ]
+  );
+
+  const contactSection = el(
+    'section',
+    { id: 'contacto', className: 'contact-section', 'aria-labelledby': 'contacto-title' },
+    [
+      el('div', { className: 'contact-header' }, [
+        el('h2', { id: 'contacto-title', style: { color: 'var(--color-primary)' } }, 'Contacto y Ubicación'),
+        el('p', { style: { color: 'var(--text-muted)', fontSize: '0.92rem' } }, 'Visítanos en la parrilla o envíanos un mensaje directo.')
+      ]),
+      el('div', { className: 'contact-bento' }, [
+        el('div', { className: 'contact-tile contact-tile--location' }, [
+          el('small', { style: { color: 'var(--color-secondary)', fontWeight: '700', letterSpacing: '0.04em' } }, 'SEDE PRINCIPAL'),
+          el('h3', {}, '📍 Zona Grill Central'),
+          el('p', { style: { opacity: '0.86', fontSize: '0.92rem' } }, about.contacto.direccion)
+        ]),
+        el('div', { className: 'contact-tile contact-tile--phone' }, [
+          el('small', { style: { color: 'var(--color-primary)', fontWeight: '700' } }, 'DOMICILIOS Y RESERVAS'),
+          el('h4', {}, '📞 Teléfono'),
+          el('p', { style: { color: 'var(--text-muted)', fontSize: '0.9rem' } }, about.contacto.telefono)
+        ]),
+        el('div', { className: 'contact-tile contact-tile--email' }, [
+          el('small', { style: { color: 'var(--color-accent)', fontWeight: '700' } }, 'ATENCIÓN DIGITAL'),
+          el('h4', {}, '✉️ Correo'),
+          el('p', { style: { color: 'var(--text-muted)', fontSize: '0.9rem' } }, about.contacto.correo)
+        ]),
+        el('div', { className: 'contact-tile contact-tile--hours' }, [
+          el('div', {}, [
+            el('small', { style: { color: '#b85d19', fontWeight: '700' } }, 'HORARIO DE PARRILLA'),
+            el('h4', { style: { marginTop: '0.2rem' } }, '🕒 Abiertos hoy'),
+            el('p', { style: { color: 'var(--text-primary)', fontSize: '0.9rem', marginTop: '0.35rem' } }, about.contacto.horario)
+          ]),
+          el('span', { className: 'badge badge-ACTIVO', style: { alignSelf: 'flex-start' } }, 'Brasa en vivo')
+        ]),
+        el('div', { className: 'contact-tile contact-tile--form' }, [
+          el('h3', { style: { marginBottom: '0.35rem' } }, 'Escríbenos'),
+          contactForm
         ])
       ])
     ]
   );
 
-  const productsGrid = el('div', { className: 'grid-3', id: 'home-products-grid' });
-  const categorySelect = el(
-    'select',
-    {
-      className: 'form-control',
-      style: { minWidth: '240px' },
-      'aria-label': 'Filtrar por categoría',
-      onChange: (e) => {
-        appState.selectedCategory = e.target.value;
-        populateHomeProducts(productsGrid);
-      }
-    },
-    [el('option', { value: '' }, 'Todas las Categorías')]
-  );
-
-  const catalogSection = el('section', { id: 'catalogo', style: { marginBottom: '2.5rem' } }, [
-    el(
-      'div',
-      {
-        style: {
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          marginBottom: '1.1rem',
-          flexWrap: 'wrap',
-          gap: '0.8rem'
-        }
-      },
-      [
-        el('div', {}, [
-          el('h2', {}, 'Nuestro Menú a la Brasa'),
-          el(
-            'p',
-            { style: { color: 'var(--text-muted)' } },
-            'Disponibilidad sincronizada en vivo con nuestro inventario.'
-          )
-        ]),
-        categorySelect
-      ]
-    ),
-    productsGrid
-  ]);
-
-  const eventsGrid = el('div', { className: 'grid-3', id: 'home-events-grid' });
-  const eventsSection = el('section', { id: 'eventos', style: { marginBottom: '2.5rem' } }, [
-    el('h2', { style: { marginBottom: '0.35rem' } }, 'Eventos, Promociones y Sorteos Activos'),
-    el(
-      'p',
-      { style: { color: 'var(--text-muted)', marginBottom: '1.1rem' } },
-      'Inicia sesión como cliente para inscribirte en sorteos y obtener tu boleto digital.'
-    ),
-    eventsGrid
-  ]);
-
-  const contactSection = el('section', { id: 'contacto', className: 'card' }, [
-    el('div', { className: 'card-body' }, [
-      el('h2', { style: { color: 'var(--color-primary)' } }, 'Sección de Contacto'),
-      el('div', { className: 'grid-3', style: { marginTop: '0.5rem' } }, [
-        el('div', {}, [
-          el('h4', {}, '📍 Sede Principal'),
-          el('p', { style: { color: 'var(--text-muted)' } }, about.contacto.direccion)
-        ]),
-        el('div', {}, [
-          el('h4', {}, '📞 Atención y Domicilios'),
-          el(
-            'p',
-            { style: { color: 'var(--text-muted)' } },
-            `${about.contacto.telefono} · ${about.contacto.correo}`
-          )
-        ]),
-        el('div', {}, [
-          el('h4', {}, '🕒 Horario de Parrilla'),
-          el('p', { style: { color: 'var(--text-muted)' } }, about.contacto.horario)
-        ])
-      ])
-    ])
-  ]);
-
   root.appendChild(hero);
-  root.appendChild(aboutSection);
   root.appendChild(catalogSection);
   root.appendChild(eventsSection);
+  root.appendChild(aboutSection);
   root.appendChild(contactSection);
+
+  activeBurgerController = mountInteractiveBurger(burgerMount, {
+    heroElement: hero,
+    indicatorButtons: segmentBtns,
+    toggleButton: toggleBtn
+  });
 
   try {
     const [prodRes, evRes] = await Promise.all([
@@ -313,12 +534,8 @@ async function renderHomeView(root) {
     appState.categories = prodRes.data.categories || [];
     appState.events = evRes.data.events || [];
 
-    for (const cat of appState.categories) {
-      categorySelect.appendChild(el('option', { value: String(cat.id) }, cat.nombre));
-    }
-
-    populateHomeProducts(productsGrid);
-    populateHomeEvents(eventsGrid);
+    syncHomeTabs(appState.homeTab);
+    populateHomeEvents(eventsHost);
   } catch (err) {
     showNotification(err.message || 'No se pudo conectar con el backend de SazónYA.', 'error');
   }
@@ -326,13 +543,18 @@ async function renderHomeView(root) {
 
 function populateHomeProducts(grid) {
   clearContainer(grid);
-  const filtered = appState.selectedCategory
-    ? appState.products.filter((p) => p.categoria_id === Number(appState.selectedCategory))
-    : appState.products;
+  const filtered = filterProductsByHomeTab(appState.products, appState.categories, appState.homeTab);
+
+  if (filtered.length === 0) {
+    grid.appendChild(
+      el('p', { style: { color: 'var(--text-muted)' } }, 'No hay productos disponibles en esta categoría.')
+    );
+    return;
+  }
 
   for (const prod of filtered) {
     const img = el('img', {
-      src: prod.imagen_url || buildSvgDataUri(prod.nombre),
+      src: resolveAssetUrl(prod.imagen_url) || buildSvgDataUri(prod.nombre),
       alt: prod.nombre,
       className: 'product-img'
     });
@@ -343,7 +565,7 @@ function populateHomeProducts(grid) {
       el('div', { className: 'card-body' }, [
         el(
           'div',
-          { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+          { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.45rem' } },
           [
             el('span', { className: `badge badge-${prod.estado}` }, prod.estado),
             el(
@@ -354,7 +576,7 @@ function populateHomeProducts(grid) {
           ]
         ),
         el('h3', {}, prod.nombre),
-        el('p', { style: { fontSize: '0.9rem', color: 'var(--text-muted)', flex: '1' } }, prod.descripcion),
+        el('p', { className: 'product-desc', title: prod.descripcion }, prod.descripcion),
         el(
           'div',
           {
@@ -362,22 +584,25 @@ function populateHomeProducts(grid) {
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
-              marginTop: '0.5rem'
+              flexWrap: 'wrap',
+              gap: '0.45rem',
+              marginTop: 'auto',
+              paddingTop: '0.35rem'
             }
           },
           [
             el(
               'span',
-              { className: 'price-tag', style: { fontSize: '1.35rem', color: 'var(--color-primary)' } },
+              { className: 'price-tag', style: { fontSize: '1.25rem', color: 'var(--color-primary)' } },
               formatCurrency(prod.precio_venta)
             ),
             el(
               'a',
               {
                 href: isAuthenticated() ? '#portal' : '#login',
-                className: 'btn btn-primary'
+                className: 'btn btn-primary btn-sm'
               },
-              isAuthenticated() ? 'Pedir / Calificar' : 'Inicia Sesión para Pedir'
+              isAuthenticated() ? 'Ordenar' : 'Pedir'
             )
           ]
         )
@@ -388,46 +613,9 @@ function populateHomeProducts(grid) {
   animateStaggerCards(grid, '.card');
 }
 
-function populateHomeEvents(grid) {
-  clearContainer(grid);
-  for (const ev of appState.events) {
-    const card = el('article', { className: 'card' }, [
-      el('div', { className: 'card-body' }, [
-        el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-          el('span', { className: 'badge badge-ACTIVO' }, ev.tipo),
-          ev.porcentaje_descuento > 0
-            ? el('span', { className: 'badge badge-STOCK_BAJO' }, `-${ev.porcentaje_descuento}% DTO`)
-            : null
-        ]),
-        el('h3', {}, ev.titulo),
-        el('p', { style: { fontSize: '0.92rem', color: 'var(--text-muted)', flex: '1' } }, ev.descripcion),
-        ev.premio_sorteo
-          ? el(
-              'p',
-              { style: { fontSize: '0.86rem', fontWeight: '600', color: 'var(--color-accent)' } },
-              `🎁 Premio: ${ev.premio_sorteo}`
-            )
-          : null,
-        ev.cupo_maximo
-          ? el(
-              'p',
-              { style: { fontSize: '0.84rem', color: 'var(--text-muted)' } },
-              `Cupos restantes: ${ev.cupos_restantes} de ${ev.cupo_maximo}`
-            )
-          : null,
-        el(
-          'a',
-          {
-            href: isAuthenticated() ? '#portal' : '#login',
-            className: 'btn btn-secondary'
-          },
-          isAuthenticated() ? 'Participar en Mi Portal' : 'Iniciar Sesión para Participar'
-        )
-      ])
-    ]);
-    grid.appendChild(card);
-  }
-  animateStaggerCards(grid, '.card');
+function populateHomeEvents(host) {
+  clearContainer(host);
+  host.appendChild(renderCardlessEventsShowcase(appState.events, { mode: 'public' }));
 }
 
 /* ==========================================================================
@@ -803,14 +991,14 @@ async function renderUserPortalView(root) {
   }
 
   const tabs = [
-    { id: 'pedidos', label: '🍔 Realizar Pedidos' },
+    { id: 'pedidos', label: '🍔 Pedidos' },
     { id: 'favoritos', label: '❤️ Favoritos' },
-    { id: 'resenas', label: '★ Calificar y Reseñar' },
-    { id: 'recomendar', label: '💡 Recomendar Producto' },
-    { id: 'eventos', label: '🎟️ Eventos y Sorteos' }
+    { id: 'resenas', label: '★ Reseñas' },
+    { id: 'recomendar', label: '💡 Sugerir' },
+    { id: 'eventos', label: '🎟️ Eventos' }
   ];
 
-  const tabBar = el('div', { style: { display: 'flex', gap: '0.5rem', flexWrap: 'wrap' } });
+  const tabBar = el('div', { style: { display: 'flex', gap: '0.45rem', flexWrap: 'wrap' } });
   const contentArea = el('div', { id: 'portal-tab-content' });
 
   function drawTabs() {
@@ -821,7 +1009,7 @@ async function renderUserPortalView(root) {
           'button',
           {
             type: 'button',
-            className: `btn ${appState.userTab === t.id ? 'btn-primary' : 'btn-outline'}`,
+            className: `btn btn-sm ${appState.userTab === t.id ? 'btn-primary' : 'btn-outline'}`,
             onClick: () => {
               appState.userTab = t.id;
               drawTabs();
@@ -842,19 +1030,15 @@ async function renderUserPortalView(root) {
           display: 'flex',
           justifyContent: 'space-between',
           alignItems: 'center',
-          margin: '1.5rem 0 1.25rem',
+          margin: '1.25rem 0 1rem',
           flexWrap: 'wrap',
-          gap: '1rem'
+          gap: '0.85rem'
         }
       },
       [
         el('div', {}, [
           el('h1', { style: { color: 'var(--color-primary)' } }, `Hola, ${sessionState.user?.nombre}`),
-          el(
-            'p',
-            { style: { color: 'var(--text-muted)' } },
-            'Realiza pedidos en vivo, administra tu sección de favoritos, califica con estrellas, recomienda productos y participa en sorteos.'
-          )
+          el('p', { style: { color: 'var(--text-muted)', fontSize: '0.9rem' } }, 'Pedidos, favoritos, reseñas y sorteos.')
         ]),
         tabBar
       ]
@@ -891,22 +1075,22 @@ function drawActivePortalTab(container) {
   clearContainer(container);
 
   if (appState.userTab === 'pedidos') {
-    const menuGrid = el('div', { className: 'grid-3' });
+    const menuGrid = el('div', { className: 'portal-menu-grid' });
     for (const prod of appState.products) {
       const img = el('img', {
-        src: prod.imagen_url || buildSvgDataUri(prod.nombre),
+        src: resolveAssetUrl(prod.imagen_url) || buildSvgDataUri(prod.nombre),
         alt: prod.nombre,
-        className: 'product-img',
-        style: { height: '155px' }
+        className: 'product-img'
       });
       attachImageFallback(img, prod.nombre);
 
+      const isFav = isProductFavorite(prod.id);
       const favBtn = el(
         'button',
         {
           type: 'button',
-          className: 'btn btn-outline',
-          style: { padding: '0.25rem 0.55rem', fontSize: '0.82rem' },
+          className: 'btn btn-outline btn-sm',
+          'aria-label': isFav ? `Quitar ${prod.nombre} de favoritos` : `Agregar ${prod.nombre} a favoritos`,
           onClick: async () => {
             try {
               const res = await apiRequest(`/favorites/${prod.id}/toggle`, { method: 'POST' });
@@ -918,14 +1102,14 @@ function drawActivePortalTab(container) {
             }
           }
         },
-        isProductFavorite(prod.id) ? '❤️ Favorito' : '🤍 Favorito'
+        isFav ? '❤️' : '🤍'
       );
 
       const addBtn = el(
         'button',
         {
           type: 'button',
-          className: 'btn btn-primary',
+          className: 'btn btn-primary btn-sm',
           disabled:
             prod.estado === 'AGOTADO' || prod.estado === 'INACTIVO' || prod.stock_actual <= 0
               ? 'true'
@@ -936,49 +1120,47 @@ function drawActivePortalTab(container) {
             drawActivePortalTab(container);
           }
         },
-        prod.stock_actual > 0 ? '+ Agregar al Pedido' : 'Agotado'
+        prod.stock_actual > 0 ? '+ Agregar' : 'Agotado'
       );
 
       menuGrid.appendChild(
-        el('article', { className: 'card' }, [
+        el('article', { className: 'card card-compact' }, [
           img,
           el('div', { className: 'card-body' }, [
-            el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-              el('span', { className: `badge badge-${prod.estado}` }, prod.estado),
-              favBtn
-            ]),
-            el('h4', {}, prod.nombre),
             el(
-              'p',
-              { style: { fontSize: '0.85rem', color: 'var(--text-muted)', flex: '1' } },
-              prod.descripcion
+              'div',
+              { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.35rem' } },
+              [
+                el('span', { className: `badge badge-${prod.estado}` }, prod.estado),
+                favBtn
+              ]
             ),
-            el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-              el(
-                'strong',
-                { className: 'price-tag', style: { color: 'var(--color-primary)', fontSize: '1.15rem' } },
-                formatCurrency(prod.precio_venta)
-              ),
-              el('span', { style: { fontSize: '0.8rem', color: 'var(--text-muted)' } }, `Stock: ${prod.stock_actual}`)
-            ]),
-            addBtn
+            el('h4', {}, prod.nombre),
+            el('p', { className: 'card-desc-clamp', title: prod.descripcion }, prod.descripcion),
+            el('div', { className: 'card-footer-compact' }, [
+              el('div', {}, [
+                el(
+                  'strong',
+                  { className: 'price-tag', style: { color: 'var(--color-primary)', fontSize: '1.05rem', display: 'block' } },
+                  formatCurrency(prod.precio_venta)
+                ),
+                el('span', { style: { fontSize: '0.72rem', color: 'var(--text-muted)' } }, `Stock: ${prod.stock_actual}`)
+              ]),
+              addBtn
+            ])
           ])
         ])
       );
     }
 
-    // Carrito
+    // Carrito compacto
     const cartCardBody = el('div', { className: 'card-body' }, [
-      el('h3', { style: { color: 'var(--color-primary)' } }, '🛒 Tu Pedido Actual')
+      el('h3', { style: { color: 'var(--color-primary)' } }, '🛒 Tu Pedido')
     ]);
 
     if (appState.cart.length === 0) {
       cartCardBody.appendChild(
-        el(
-          'p',
-          { style: { color: 'var(--text-muted)', fontSize: '0.92rem' } },
-          'Selecciona hamburguesas, papas o bebidas del menú para armar tu pedido.'
-        )
+        el('p', { style: { color: 'var(--text-muted)', fontSize: '0.88rem' } }, 'Agrega productos del menú.')
       );
     } else {
       for (const item of appState.cart) {
@@ -990,26 +1172,23 @@ function drawActivePortalTab(container) {
                 display: 'flex',
                 justifyContent: 'space-between',
                 alignItems: 'center',
-                padding: '0.55rem 0',
+                flexWrap: 'wrap',
+                gap: '0.45rem',
+                padding: '0.5rem 0',
                 borderBottom: '1px solid var(--border-subtle)'
               }
             },
             [
               el('div', {}, [
-                el('strong', {}, item.nombre),
-                el(
-                  'div',
-                  { style: { fontSize: '0.82rem', color: 'var(--text-muted)' } },
-                  `${formatCurrency(item.precio_venta)} c/u`
-                )
+                el('strong', { style: { fontSize: '0.9rem' } }, item.nombre),
+                el('div', { style: { fontSize: '0.78rem', color: 'var(--text-muted)' } }, `${formatCurrency(item.precio_venta)} c/u`)
               ]),
-              el('div', { style: { display: 'flex', alignItems: 'center', gap: '0.45rem' } }, [
+              el('div', { style: { display: 'flex', alignItems: 'center', gap: '0.4rem' } }, [
                 el(
                   'button',
                   {
                     type: 'button',
-                    className: 'btn btn-outline',
-                    style: { padding: '0.2rem 0.55rem' },
+                    className: 'btn btn-outline btn-sm',
                     onClick: () => {
                       item.cantidad -= 1;
                       if (item.cantidad <= 0) {
@@ -1025,8 +1204,7 @@ function drawActivePortalTab(container) {
                   'button',
                   {
                     type: 'button',
-                    className: 'btn btn-outline',
-                    style: { padding: '0.2rem 0.55rem' },
+                    className: 'btn btn-outline btn-sm',
                     onClick: () => {
                       if (item.cantidad < item.stock_max) {
                         item.cantidad += 1;
@@ -1045,14 +1223,14 @@ function drawActivePortalTab(container) {
       const notesInput = el('input', {
         type: 'text',
         className: 'form-control',
-        placeholder: 'Ej: Sin cebolla, extra salsa secreta...'
+        placeholder: 'Sin cebolla, extra salsa...'
       });
 
       const total = appState.cart.reduce((acc, i) => acc + i.precio_venta * i.cantidad, 0);
 
       cartCardBody.appendChild(
-        el('div', { className: 'form-group', style: { marginTop: '0.75rem' } }, [
-          el('label', { className: 'form-label' }, 'Notas de preparación o entrega'),
+        el('div', { className: 'form-group', style: { marginTop: '0.65rem', marginBottom: '0.5rem' } }, [
+          el('label', { className: 'form-label' }, 'Notas (opcional)'),
           notesInput
         ])
       );
@@ -1060,12 +1238,12 @@ function drawActivePortalTab(container) {
       cartCardBody.appendChild(
         el(
           'div',
-          { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '0.75rem 0' } },
+          { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.45rem', margin: '0.5rem 0' } },
           [
-            el('span', {}, 'Total a Pagar:'),
+            el('span', {}, 'Total:'),
             el(
               'strong',
-              { className: 'price-tag', style: { fontSize: '1.45rem', color: 'var(--color-primary)' } },
+              { className: 'price-tag', style: { fontSize: '1.3rem', color: 'var(--color-primary)' } },
               formatCurrency(total)
             )
           ]
@@ -1100,28 +1278,32 @@ function drawActivePortalTab(container) {
               }
             }
           },
-          'Confirmar Pedido Ahora'
+          'Confirmar Pedido'
         )
       );
     }
 
-    const ordersCardBody = el('div', { className: 'card-body' }, [el('h3', {}, 'Mis Pedidos Recientes')]);
+    const ordersCardBody = el('div', { className: 'card-body' }, [el('h3', {}, 'Pedidos Recientes')]);
     if (appState.myOrders.length === 0) {
-      ordersCardBody.appendChild(el('p', { style: { color: 'var(--text-muted)' } }, 'Aún no has realizado pedidos.'));
+      ordersCardBody.appendChild(el('p', { style: { color: 'var(--text-muted)', fontSize: '0.88rem' } }, 'Sin pedidos aún.'));
     } else {
       for (const ord of appState.myOrders) {
         ordersCardBody.appendChild(
           el(
             'div',
-            { style: { padding: '0.65rem 0', borderBottom: '1px solid var(--border-subtle)' } },
+            { style: { padding: '0.55rem 0', borderBottom: '1px solid var(--border-subtle)' } },
             [
-              el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-                el('strong', {}, `Pedido #${ord.id}`),
-                el('span', { className: 'badge badge-DISPONIBLE' }, ord.estado)
-              ]),
+              el(
+                'div',
+                { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.4rem' } },
+                [
+                  el('strong', { style: { fontSize: '0.9rem' } }, `Pedido #${ord.id}`),
+                  el('span', { className: 'badge badge-DISPONIBLE' }, ord.estado)
+                ]
+              ),
               el(
                 'p',
-                { style: { fontSize: '0.86rem', color: 'var(--text-muted)' } },
+                { style: { fontSize: '0.82rem', color: 'var(--text-muted)' } },
                 `Total: ${formatCurrency(ord.total_venta)}${ord.notas_entrega ? ` · "${ord.notas_entrega}"` : ''}`
               )
             ]
@@ -1131,56 +1313,56 @@ function drawActivePortalTab(container) {
     }
 
     container.appendChild(
-      el('div', { className: 'grid-2' }, [
-        el('div', {}, [el('h2', { style: { marginBottom: '0.9rem' } }, 'Menú Disponible'), menuGrid]),
-        el('div', {}, [
-          el('div', { className: 'card', style: { marginBottom: '1.35rem' } }, [cartCardBody]),
+      el('div', { className: 'portal-orders-layout' }, [
+        el('div', {}, [el('h2', { style: { marginBottom: '0.85rem' } }, 'Menú Disponible'), menuGrid]),
+        el('div', { className: 'portal-sidebar' }, [
+          el('div', { className: 'card', style: { marginBottom: '1.1rem' } }, [cartCardBody]),
           el('div', { className: 'card' }, [ordersCardBody])
         ])
       ])
     );
   } else if (appState.userTab === 'favoritos') {
-    container.appendChild(el('h2', { style: { marginBottom: '0.9rem' } }, '❤️ Mi Sección de Favoritos'));
+    container.appendChild(el('h2', { style: { marginBottom: '0.85rem' } }, '❤️ Mis Favoritos'));
     if (appState.favorites.length === 0) {
       container.appendChild(
-        el(
-          'div',
-          { className: 'card card-body' },
-          'Aún no tienes productos en tu sección de favoritos. Marca tus preferidos con ❤️ desde el menú.'
-        )
+        el('div', { className: 'card card-body' }, 'Aún no tienes favoritos. Marca productos con ❤️ desde el menú.')
       );
     } else {
-      const grid = el('div', { className: 'grid-3' });
+      const grid = el('div', { className: 'portal-menu-grid' });
       for (const fav of appState.favorites) {
         const img = el('img', {
-          src: fav.imagen_url || buildSvgDataUri(fav.nombre),
+          src: resolveAssetUrl(fav.imagen_url) || buildSvgDataUri(fav.nombre),
           alt: fav.nombre,
           className: 'product-img'
         });
         attachImageFallback(img, fav.nombre);
 
         grid.appendChild(
-          el('article', { className: 'card' }, [
+          el('article', { className: 'card card-compact' }, [
             img,
             el('div', { className: 'card-body' }, [
-              el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-                el('span', { className: `badge badge-${fav.estado}` }, fav.estado),
-                el('span', { className: 'stars' }, `★ ${Number(fav.promedio_estrellas || 0).toFixed(1)}`)
-              ]),
+              el(
+                'div',
+                { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.35rem' } },
+                [
+                  el('span', { className: `badge badge-${fav.estado}` }, fav.estado),
+                  el('span', { className: 'stars', style: { fontSize: '0.84rem' } }, `★ ${Number(fav.promedio_estrellas || 0).toFixed(1)}`)
+                ]
+              ),
               el('h3', {}, fav.nombre),
-              el('p', { style: { fontSize: '0.9rem', color: 'var(--text-muted)', flex: '1' } }, fav.descripcion),
-              el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }, [
+              el('p', { className: 'card-desc-clamp', title: fav.descripcion }, fav.descripcion),
+              el('div', { className: 'card-footer-compact' }, [
                 el(
                   'strong',
                   { className: 'price-tag', style: { color: 'var(--color-primary)' } },
                   formatCurrency(fav.precio_venta)
                 ),
-                el('div', { style: { display: 'flex', gap: '0.45rem' } }, [
+                el('div', { style: { display: 'flex', gap: '0.35rem', flexWrap: 'wrap' } }, [
                   el(
                     'button',
                     {
                       type: 'button',
-                      className: 'btn btn-outline',
+                      className: 'btn btn-outline btn-sm',
                       onClick: async () => {
                         const res = await apiRequest(`/favorites/${fav.id}/toggle`, { method: 'POST' });
                         showNotification(res.message, 'success');
@@ -1194,7 +1376,7 @@ function drawActivePortalTab(container) {
                     'button',
                     {
                       type: 'button',
-                      className: 'btn btn-primary',
+                      className: 'btn btn-primary btn-sm',
                       onClick: () => {
                         addToCart(fav);
                         appState.userTab = 'pedidos';
@@ -1218,11 +1400,11 @@ function drawActivePortalTab(container) {
       { className: 'form-control' },
       appState.products.map((p) => el('option', { value: String(p.id) }, p.nombre))
     );
-    const starsWrap = el('div', { style: { display: 'flex', gap: '0.45rem' } });
+    const starsWrap = el('div', { className: 'stars-picker' });
     const commentArea = el('textarea', {
       rows: '3',
       className: 'form-control',
-      placeholder: 'Cuéntanos qué te pareció el sabor, la cocción y las salsas...',
+      placeholder: 'Cuéntanos sobre el sabor y las salsas...',
       required: 'true'
     });
 
@@ -1233,7 +1415,7 @@ function drawActivePortalTab(container) {
           'button',
           {
             type: 'button',
-            className: `btn ${selectedStars >= s ? 'btn-secondary' : 'btn-outline'}`,
+            className: `btn btn-sm ${selectedStars >= s ? 'btn-secondary' : 'btn-outline'}`,
             onClick: () => {
               selectedStars = s;
               renderStarButtons();
@@ -1272,35 +1454,37 @@ function drawActivePortalTab(container) {
       },
       [
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Selecciona el Producto'),
+          el('label', { className: 'form-label' }, 'Producto'),
           prodSelect
         ]),
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Calificación (Estrellas 1 a 5)'),
+          el('label', { className: 'form-label' }, 'Calificación'),
           starsWrap
         ]),
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Tu Reseña del Producto'),
+          el('label', { className: 'form-label' }, 'Reseña'),
           commentArea
         ]),
-        el('button', { type: 'submit', className: 'btn btn-primary' }, 'Guardar Calificación y Reseña')
+        el('button', { type: 'submit', className: 'btn btn-primary btn-sm' }, 'Guardar Reseña')
       ]
     );
 
-    const reviewsList = el('div', { className: 'card-body' }, [
-      el('h3', {}, 'Reseñas de la Comunidad SazónYA')
-    ]);
+    const reviewsList = el('div', { className: 'card-body' }, [el('h3', {}, 'Reseñas Recientes')]);
     for (const rev of appState.reviews) {
       reviewsList.appendChild(
         el(
           'div',
-          { style: { padding: '0.7rem 0', borderBottom: '1px solid var(--border-subtle)' } },
+          { style: { padding: '0.6rem 0', borderBottom: '1px solid var(--border-subtle)' } },
           [
-            el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-              el('strong', {}, rev.producto_nombre),
-              el('span', { className: 'stars' }, `${'★'.repeat(rev.estrellas)} (${rev.estrellas}/5)`)
-            ]),
-            el('p', { style: { fontSize: '0.9rem', margin: '0.25rem 0' } }, `"${rev.comentario}"`),
+            el(
+              'div',
+              { style: { display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.4rem' } },
+              [
+                el('strong', {}, rev.producto_nombre),
+                el('span', { className: 'stars' }, `${'★'.repeat(rev.estrellas)} (${rev.estrellas}/5)`)
+              ]
+            ),
+            el('p', { style: { fontSize: '0.88rem', margin: '0.2rem 0' } }, `"${rev.comentario}"`),
             el('small', { style: { color: 'var(--text-muted)' } }, `Por ${rev.usuario_nombre}`)
           ]
         )
@@ -1311,7 +1495,7 @@ function drawActivePortalTab(container) {
       el('div', { className: 'grid-2' }, [
         el('div', { className: 'card' }, [
           el('div', { className: 'card-body' }, [
-            el('h3', { style: { color: 'var(--color-primary)' } }, '★ Calificar Producto y Asignar Reseña'),
+            el('h3', { style: { color: 'var(--color-primary)' } }, '★ Calificar Producto'),
             reviewForm
           ])
         ]),
@@ -1322,13 +1506,13 @@ function drawActivePortalTab(container) {
     const nameInput = el('input', {
       type: 'text',
       className: 'form-control',
-      placeholder: 'Ej: Hamburguesa Doble Costilla BBQ',
+      placeholder: 'Ej: Burger Costilla BBQ',
       required: 'true'
     });
     const descInput = el('textarea', {
-      rows: '4',
+      rows: '3',
       className: 'form-control',
-      placeholder: 'Describe qué ingredientes, quesos o condimentos debería llevar (mínimo 15 caracteres)...',
+      placeholder: 'Ingredientes y preparación (mín. 15 caracteres)...',
       required: 'true'
     });
 
@@ -1357,31 +1541,35 @@ function drawActivePortalTab(container) {
       },
       [
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Nombre Sugerido del Producto'),
+          el('label', { className: 'form-label' }, 'Nombre Sugerido'),
           nameInput
         ]),
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Ingredientes y Preparación Sugerida'),
+          el('label', { className: 'form-label' }, 'Ingredientes'),
           descInput
         ]),
-        el('button', { type: 'submit', className: 'btn btn-primary' }, 'Enviar Recomendación al Administrador')
+        el('button', { type: 'submit', className: 'btn btn-primary btn-sm' }, 'Enviar Sugerencia')
       ]
     );
 
-    const recList = el('div', { className: 'card-body' }, [el('h3', {}, 'Propuestas Enviadas')]);
+    const recList = el('div', { className: 'card-body' }, [el('h3', {}, 'Sugerencias')]);
     for (const rec of appState.recommendations) {
       recList.appendChild(
         el(
           'div',
-          { style: { padding: '0.7rem 0', borderBottom: '1px solid var(--border-subtle)' } },
+          { style: { padding: '0.6rem 0', borderBottom: '1px solid var(--border-subtle)' } },
           [
-            el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-              el('strong', {}, rec.nombre_sugerido),
-              el('span', { className: `badge badge-${rec.estado}` }, rec.estado)
-            ]),
+            el(
+              'div',
+              { style: { display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.4rem' } },
+              [
+                el('strong', {}, rec.nombre_sugerido),
+                el('span', { className: `badge badge-${rec.estado}` }, rec.estado)
+              ]
+            ),
             el(
               'p',
-              { style: { fontSize: '0.88rem', color: 'var(--text-muted)', marginTop: '0.25rem' } },
+              { style: { fontSize: '0.86rem', color: 'var(--text-muted)', marginTop: '0.2rem' } },
               rec.descripcion_ingredientes
             )
           ]
@@ -1393,7 +1581,7 @@ function drawActivePortalTab(container) {
       el('div', { className: 'grid-2' }, [
         el('div', { className: 'card' }, [
           el('div', { className: 'card-body' }, [
-            el('h3', { style: { color: 'var(--color-primary)' } }, '💡 Recomendar un Nuevo Producto'),
+            el('h3', { style: { color: 'var(--color-primary)' } }, '💡 Sugerir Producto'),
             recForm
           ])
         ]),
@@ -1401,63 +1589,22 @@ function drawActivePortalTab(container) {
       ])
     );
   } else if (appState.userTab === 'eventos') {
+    container.appendChild(el('h2', { style: { marginBottom: '0.85rem' } }, '🎉 Eventos y Sorteos'));
     container.appendChild(
-      el(
-        'h2',
-        { style: { marginBottom: '0.9rem' } },
-        '🎉 Eventos, Promociones y Sorteos Asignados por el Administrador'
-      )
+      renderCardlessEventsShowcase(appState.events, {
+        mode: 'portal',
+        onParticipate: async (ev) => {
+          try {
+            const res = await apiRequest(`/events/${ev.id}/participate`, { method: 'POST' });
+            showNotification(res.message, 'success');
+            await loadPortalData();
+            drawActivePortalTab(container);
+          } catch (err) {
+            showNotification(err.message, 'error');
+          }
+        }
+      })
     );
-    const grid = el('div', { className: 'grid-3' });
-    for (const ev of appState.events) {
-      grid.appendChild(
-        el('article', { className: 'card' }, [
-          el('div', { className: 'card-body' }, [
-            el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-              el('span', { className: 'badge badge-ACTIVO' }, ev.tipo),
-              ev.porcentaje_descuento > 0
-                ? el('span', { className: 'badge badge-STOCK_BAJO' }, `-${ev.porcentaje_descuento}% DTO`)
-                : null
-            ]),
-            el('h3', {}, ev.titulo),
-            el('p', { style: { fontSize: '0.9rem', color: 'var(--text-muted)', flex: '1' } }, ev.descripcion),
-            ev.premio_sorteo
-              ? el(
-                  'p',
-                  { style: { fontSize: '0.88rem', fontWeight: '600', color: 'var(--color-accent)' } },
-                  `🎁 Premio: ${ev.premio_sorteo}`
-                )
-              : null,
-            ev.cupo_maximo
-              ? el('p', { style: { fontSize: '0.85rem' } }, `Inscritos: ${ev.total_inscritos} / ${ev.cupo_maximo}`)
-              : null,
-            ev.usuario_inscrito
-              ? el('div', { className: 'status-banner success', style: { margin: '0' } }, [
-                  el('span', {}, `🎟️ Boleto: ${ev.codigo_boleto}`)
-                ])
-              : el(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'btn btn-primary',
-                    onClick: async () => {
-                      try {
-                        const res = await apiRequest(`/events/${ev.id}/participate`, { method: 'POST' });
-                        showNotification(res.message, 'success');
-                        await loadPortalData();
-                        drawActivePortalTab(container);
-                      } catch (err) {
-                        showNotification(err.message, 'error');
-                      }
-                    }
-                  },
-                  'Participar Ahora'
-                )
-          ])
-        ])
-      );
-    }
-    container.appendChild(grid);
   }
 
   animateStaggerCards(container, '.card');
@@ -1487,6 +1634,7 @@ async function renderAdminDashboardView(root) {
     navigate(isAuthenticated() ? 'portal' : 'login');
     return;
   }
+  revokeAllAdminPreviewUrls();
   clearContainer(root);
 
   try {
@@ -1513,7 +1661,7 @@ async function renderAdminDashboardView(root) {
           'button',
           {
             type: 'button',
-            className: `btn ${appState.adminTab === t.id ? 'btn-primary' : 'btn-outline'}`,
+            className: `btn btn-sm ${appState.adminTab === t.id ? 'btn-primary' : 'btn-outline'}`,
             onClick: () => {
               appState.adminTab = t.id;
               drawTabs();
@@ -1559,6 +1707,7 @@ async function renderAdminDashboardView(root) {
 }
 
 function drawActiveAdminTab(container) {
+  revokeAllAdminPreviewUrls();
   clearContainer(container);
 
   if (appState.adminTab === 'estadisticas') {
@@ -1622,6 +1771,7 @@ function drawActiveAdminTab(container) {
     }
 
     container.appendChild(kpiGrid);
+    container.appendChild(createWeeklyLineChart(stats));
     container.appendChild(
       el('div', { className: 'card' }, [
         el('div', { className: 'card-body' }, [
@@ -1658,9 +1808,10 @@ function drawActiveAdminTab(container) {
     });
   } else if (appState.adminTab === 'productos') {
     const editing = appState.editingProduct;
+
     const catSelect = el(
       'select',
-      { className: 'form-control' },
+      { id: 'admin-prod-categoria', className: 'form-control', name: 'categoria_id' },
       appState.categories.map((c) =>
         el(
           'option',
@@ -1673,14 +1824,18 @@ function drawActiveAdminTab(container) {
       )
     );
     const nombreInput = el('input', {
+      id: 'admin-prod-nombre',
       type: 'text',
+      name: 'nombre',
       className: 'form-control',
       value: editing ? editing.nombre : '',
       placeholder: 'Ej: Burger Triple Tocineta',
       required: 'true'
     });
     const descInput = el('textarea', {
+      id: 'admin-prod-descripcion',
       rows: '3',
+      name: 'descripcion',
       className: 'form-control',
       placeholder: 'Ingredientes y preparación...',
       required: 'true'
@@ -1688,7 +1843,9 @@ function drawActiveAdminTab(container) {
     descInput.value = editing ? editing.descripcion : '';
 
     const costoInput = el('input', {
+      id: 'admin-prod-costo',
       type: 'number',
+      name: 'costo_unitario',
       step: '0.01',
       min: '0',
       className: 'form-control',
@@ -1696,7 +1853,9 @@ function drawActiveAdminTab(container) {
       required: 'true'
     });
     const precioInput = el('input', {
+      id: 'admin-prod-precio',
       type: 'number',
+      name: 'precio_venta',
       step: '0.01',
       min: '0.1',
       className: 'form-control',
@@ -1704,25 +1863,103 @@ function drawActiveAdminTab(container) {
       required: 'true'
     });
     const stockInput = el('input', {
+      id: 'admin-prod-stock',
       type: 'number',
+      name: 'stock_actual',
       min: '0',
       className: 'form-control',
       value: editing ? String(editing.stock_actual) : '25',
       required: 'true'
     });
     const minInput = el('input', {
+      id: 'admin-prod-stock-min',
       type: 'number',
+      name: 'stock_minimo',
       min: '0',
       className: 'form-control',
       value: editing ? String(editing.stock_minimo) : '5',
       required: 'true'
     });
-    const imgInput = el('input', {
-      type: 'url',
+
+    const initialImgSrc = resolveAssetUrl(editing?.imagen_url) || buildSvgDataUri(editing?.nombre || 'Vista Previa');
+    const previewImg = el('img', {
+      src: initialImgSrc,
+      alt: editing?.nombre || 'Vista previa del producto',
+      className: 'admin-product-preview'
+    });
+    attachImageFallback(previewImg, editing?.nombre || 'Producto');
+
+    const previewMeta = el(
+      'div',
+      { style: { fontSize: '0.82rem', color: 'var(--text-muted)', flex: '1', minWidth: '140px', overflowWrap: 'anywhere' } },
+      editing?.imagen_url ? `Imagen actual: ${editing.imagen_url}` : 'Sin archivo seleccionado (usará vista SVG por defecto).'
+    );
+
+    const imgFileInput = el('input', {
+      id: 'admin-prod-imagen',
+      type: 'file',
+      name: 'imagen',
+      accept: 'image/png,image/jpeg,image/webp,image/gif',
+      className: 'form-control'
+    });
+
+    const imgUrlInput = el('input', {
+      id: 'admin-prod-imagen-url',
+      type: 'text',
+      name: 'imagen_url',
       className: 'form-control',
       value: editing && editing.imagen_url ? editing.imagen_url : '',
-      placeholder: 'https://...'
+      placeholder: 'https://... o /uploads/products/...'
     });
+
+    function updateProductPreviewFromUrl() {
+      if (imgFileInput.files && imgFileInput.files[0]) return;
+      const typed = imgUrlInput.value.trim();
+      previewImg.dataset.fallbackStage = '0';
+      previewImg.src = resolveAssetUrl(typed) || buildSvgDataUri(nombreInput.value.trim() || 'Vista Previa');
+      previewMeta.textContent = typed ? `URL: ${typed}` : 'Sin imagen seleccionada.';
+    }
+
+    imgFileInput.addEventListener('change', () => {
+      const file = imgFileInput.files?.[0];
+      if (!file) {
+        revokeProductPreviewUrl();
+        updateProductPreviewFromUrl();
+        return;
+      }
+      const allowedTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+      if (!allowedTypes.includes(file.type)) {
+        imgFileInput.value = '';
+        showNotification('Formato no permitido. Usa PNG, JPG, WEBP o GIF.', 'error');
+        return;
+      }
+      if (file.size > 5 * 1024 * 1024) {
+        imgFileInput.value = '';
+        showNotification('La imagen excede el máximo de 5 MB.', 'error');
+        return;
+      }
+      revokeProductPreviewUrl();
+      activeProductPreviewUrl = URL.createObjectURL(file);
+      previewImg.dataset.fallbackStage = '0';
+      previewImg.src = activeProductPreviewUrl;
+      previewMeta.textContent = `Archivo seleccionado: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+    });
+
+    imgUrlInput.addEventListener('input', updateProductPreviewFromUrl);
+
+    const clearFileBtn = el(
+      'button',
+      {
+        type: 'button',
+        className: 'btn btn-outline btn-sm',
+        onClick: () => {
+          imgFileInput.value = '';
+          revokeProductPreviewUrl();
+          updateProductPreviewFromUrl();
+        }
+      },
+      'Quitar archivo'
+    );
 
     const prodForm = el(
       'form',
@@ -1732,19 +1969,27 @@ function drawActiveAdminTab(container) {
           try {
             const path = editing ? `/products/${editing.id}` : '/products';
             const method = editing ? 'PUT' : 'POST';
+            const formData = new FormData();
+            formData.append('categoria_id', String(Number(catSelect.value)));
+            formData.append('nombre', nombreInput.value.trim());
+            formData.append('descripcion', descInput.value.trim());
+            formData.append('costo_unitario', String(Number(costoInput.value)));
+            formData.append('precio_venta', String(Number(precioInput.value)));
+            formData.append('stock_actual', String(Number(stockInput.value)));
+            formData.append('stock_minimo', String(Number(minInput.value)));
+
+            const selectedFile = imgFileInput.files?.[0];
+            if (selectedFile) {
+              formData.append('imagen', selectedFile);
+            } else if (imgUrlInput.value.trim()) {
+              formData.append('imagen_url', imgUrlInput.value.trim());
+            }
+
             const res = await apiRequest(path, {
               method,
-              body: {
-                categoria_id: Number(catSelect.value),
-                nombre: nombreInput.value.trim(),
-                descripcion: descInput.value.trim(),
-                costo_unitario: Number(costoInput.value),
-                precio_venta: Number(precioInput.value),
-                stock_actual: Number(stockInput.value),
-                stock_minimo: Number(minInput.value),
-                imagen_url: imgInput.value.trim() || null
-              }
+              body: formData
             });
+            revokeProductPreviewUrl();
             appState.editingProduct = null;
             showNotification(res.message, 'success');
             await loadAdminData();
@@ -1755,34 +2000,52 @@ function drawActiveAdminTab(container) {
         }
       },
       [
-        el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Categoría'), catSelect]),
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Nombre del Producto'),
+          el('label', { className: 'form-label', for: 'admin-prod-categoria' }, 'Categoría'),
+          catSelect
+        ]),
+        el('div', { className: 'form-group' }, [
+          el('label', { className: 'form-label', for: 'admin-prod-nombre' }, 'Nombre del Producto'),
           nombreInput
         ]),
-        el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Descripción'), descInput]),
-        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' } }, [
+        el('div', { className: 'form-group' }, [
+          el('label', { className: 'form-label', for: 'admin-prod-descripcion' }, 'Descripción'),
+          descInput
+        ]),
+        el('div', { className: 'form-row-2' }, [
           el('div', { className: 'form-group' }, [
-            el('label', { className: 'form-label' }, 'Costo Unitario ($)'),
+            el('label', { className: 'form-label', for: 'admin-prod-costo' }, 'Costo Unitario ($)'),
             costoInput
           ]),
           el('div', { className: 'form-group' }, [
-            el('label', { className: 'form-label' }, 'Precio de Venta ($)'),
+            el('label', { className: 'form-label', for: 'admin-prod-precio' }, 'Precio de Venta ($)'),
             precioInput
           ])
         ]),
-        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' } }, [
-          el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Stock Actual'), stockInput]),
+        el('div', { className: 'form-row-2' }, [
           el('div', { className: 'form-group' }, [
-            el('label', { className: 'form-label' }, 'Stock Mínimo'),
+            el('label', { className: 'form-label', for: 'admin-prod-stock' }, 'Stock Actual'),
+            stockInput
+          ]),
+          el('div', { className: 'form-group' }, [
+            el('label', { className: 'form-label', for: 'admin-prod-stock-min' }, 'Stock Mínimo'),
             minInput
           ])
         ]),
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'URL de Imagen (Opcional)'),
-          imgInput
+          el(
+            'label',
+            { className: 'form-label', for: 'admin-prod-imagen' },
+            'Cargar Imagen desde Dispositivo (PNG/JPG/WEBP/GIF · Máx 5 MB)'
+          ),
+          imgFileInput
         ]),
-        el('div', { style: { display: 'flex', gap: '0.6rem' } }, [
+        el('div', { className: 'image-preview-box' }, [previewImg, previewMeta, clearFileBtn]),
+        el('div', { className: 'form-group' }, [
+          el('label', { className: 'form-label', for: 'admin-prod-imagen-url' }, 'O URL de Imagen (Opcional)'),
+          imgUrlInput
+        ]),
+        el('div', { style: { display: 'flex', gap: '0.6rem', flexWrap: 'wrap' } }, [
           el(
             'button',
             { type: 'submit', className: 'btn btn-primary' },
@@ -1795,6 +2058,7 @@ function drawActiveAdminTab(container) {
                   type: 'button',
                   className: 'btn btn-outline',
                   onClick: () => {
+                    revokeProductPreviewUrl();
                     appState.editingProduct = null;
                     drawActiveAdminTab(container);
                   }
@@ -1808,23 +2072,34 @@ function drawActiveAdminTab(container) {
 
     const tbody = el('tbody');
     for (const prod of appState.products) {
+      const thumbImg = el('img', {
+        src: resolveAssetUrl(prod.imagen_url) || buildSvgDataUri(prod.nombre),
+        alt: prod.nombre,
+        className: 'admin-thumb'
+      });
+      attachImageFallback(thumbImg, prod.nombre);
+
       tbody.appendChild(
         el('tr', {}, [
           el('td', {}, [
-            el('strong', {}, prod.nombre),
-            el('div', { style: { fontSize: '0.78rem', color: 'var(--text-muted)' } }, prod.categoria_nombre)
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '0.65rem' } }, [
+              thumbImg,
+              el('div', {}, [
+                el('strong', {}, prod.nombre),
+                el('div', { style: { fontSize: '0.78rem', color: 'var(--text-muted)' } }, prod.categoria_nombre)
+              ])
+            ])
           ]),
           el('td', {}, `${formatCurrency(prod.costo_unitario)} / ${formatCurrency(prod.precio_venta)}`),
           el('td', {}, `${prod.stock_actual} (mín ${prod.stock_minimo})`),
           el('td', {}, [el('span', { className: `badge badge-${prod.estado}` }, prod.estado)]),
           el('td', {}, [
-            el('div', { style: { display: 'flex', gap: '0.35rem' } }, [
+            el('div', { style: { display: 'flex', gap: '0.35rem', flexWrap: 'wrap' } }, [
               el(
                 'button',
                 {
                   type: 'button',
-                  className: 'btn btn-outline',
-                  style: { padding: '0.25rem 0.55rem' },
+                  className: 'btn btn-outline btn-sm',
                   onClick: () => {
                     appState.editingProduct = prod;
                     drawActiveAdminTab(container);
@@ -1836,8 +2111,7 @@ function drawActiveAdminTab(container) {
                 'button',
                 {
                   type: 'button',
-                  className: 'btn btn-danger',
-                  style: { padding: '0.25rem 0.55rem' },
+                  className: 'btn btn-danger btn-sm',
                   onClick: async () => {
                     try {
                       const res = await apiRequest(`/products/${prod.id}`, { method: 'DELETE' });
@@ -1954,14 +2228,14 @@ function drawActiveAdminTab(container) {
           el('label', { className: 'form-label' }, 'Nombre del Condimento / Salsa / Insumo'),
           nombreInput
         ]),
-        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' } }, [
+        el('div', { className: 'form-row-2' }, [
           el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Tipo'), tipoSelect]),
           el('div', { className: 'form-group' }, [
             el('label', { className: 'form-label' }, 'Unidad de Medida'),
             unidadInput
           ])
         ]),
-        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' } }, [
+        el('div', { className: 'form-row-2' }, [
           el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Stock Actual'), stockInput]),
           el('div', { className: 'form-group' }, [
             el('label', { className: 'form-label' }, 'Stock Mínimo'),
@@ -1981,13 +2255,12 @@ function drawActiveAdminTab(container) {
           el('td', {}, `${cond.stock_actual} ${cond.unidad_medida} (mín ${cond.stock_minimo})`),
           el('td', {}, [el('span', { className: `badge badge-${cond.estado}` }, cond.estado)]),
           el('td', {}, [
-            el('div', { style: { display: 'flex', gap: '0.35rem' } }, [
+            el('div', { style: { display: 'flex', gap: '0.35rem', flexWrap: 'wrap' } }, [
               el(
                 'button',
                 {
                   type: 'button',
-                  className: 'btn btn-outline',
-                  style: { padding: '0.22rem 0.5rem' },
+                  className: 'btn btn-outline btn-sm',
                   onClick: async () => {
                     const res = await apiRequest(`/condiments/${cond.id}`, {
                       method: 'PUT',
@@ -2004,8 +2277,7 @@ function drawActiveAdminTab(container) {
                 'button',
                 {
                   type: 'button',
-                  className: 'btn btn-outline',
-                  style: { padding: '0.22rem 0.5rem' },
+                  className: 'btn btn-outline btn-sm',
                   onClick: async () => {
                     const res = await apiRequest(`/condiments/${cond.id}`, {
                       method: 'PUT',
@@ -2054,41 +2326,149 @@ function drawActiveAdminTab(container) {
       ])
     );
   } else if (appState.adminTab === 'eventos') {
+    const editingEv = appState.editingEvent;
+
     const tituloInput = el('input', {
+      id: 'admin-ev-titulo',
       type: 'text',
       className: 'form-control',
+      value: editingEv ? editingEv.titulo : '',
       placeholder: 'Ej: Viernes de Papas Fritas 2x1',
       required: 'true'
     });
     const descInput = el('textarea', {
+      id: 'admin-ev-descripcion',
       rows: '3',
       className: 'form-control',
       placeholder: 'Condiciones, premios o beneficios...',
       required: 'true'
     });
-    const tipoSelect = el('select', { className: 'form-control' }, [
-      el('option', { value: 'PROMOCION' }, 'PROMOCION'),
-      el('option', { value: 'SORTEO' }, 'SORTEO'),
-      el('option', { value: 'EVENTO' }, 'EVENTO')
+    descInput.value = editingEv ? editingEv.descripcion : '';
+
+    const tipoSelect = el('select', { id: 'admin-ev-tipo', className: 'form-control' }, [
+      el('option', { value: 'PROMOCION', selected: editingEv?.tipo === 'PROMOCION' ? 'true' : null }, 'PROMOCION'),
+      el('option', { value: 'SORTEO', selected: editingEv?.tipo === 'SORTEO' ? 'true' : null }, 'SORTEO'),
+      el('option', { value: 'EVENTO', selected: editingEv?.tipo === 'EVENTO' ? 'true' : null }, 'EVENTO')
     ]);
     const dtoInput = el('input', {
+      id: 'admin-ev-descuento',
       type: 'number',
       min: '0',
       max: '100',
-      value: '15',
+      value: editingEv ? String(editingEv.porcentaje_descuento ?? 0) : '15',
       className: 'form-control'
     });
     const cupoInput = el('input', {
+      id: 'admin-ev-cupo',
       type: 'number',
       min: '1',
-      value: '50',
+      value: editingEv?.cupo_maximo ? String(editingEv.cupo_maximo) : '50',
       className: 'form-control'
     });
     const premioInput = el('input', {
+      id: 'admin-ev-premio',
       type: 'text',
       className: 'form-control',
+      value: editingEv?.premio_sorteo || '',
       placeholder: 'Ej: Combo Parrillero Imperial Gratis'
     });
+
+    const mediaTipoSelect = el('select', { id: 'admin-ev-media-tipo', className: 'form-control', name: 'media_tipo' }, [
+      el('option', { value: 'NONE', selected: !editingEv?.media_tipo || editingEv.media_tipo === 'NONE' ? 'true' : null }, 'NONE (Solo texto)'),
+      el('option', { value: 'VIDEO', selected: editingEv?.media_tipo === 'VIDEO' ? 'true' : null }, 'VIDEO (YouTube/Vimeo/MP4)'),
+      el('option', { value: 'POSTING', selected: editingEv?.media_tipo === 'POSTING' ? 'true' : null }, 'POSTING (Publicación editorial/imagen)')
+    ]);
+    const mediaUrlInput = el('input', {
+      id: 'admin-ev-media-url',
+      type: 'text',
+      name: 'media_url',
+      className: 'form-control',
+      value: editingEv?.media_url || '',
+      placeholder: 'https://youtube.com/... o /uploads/events/...'
+    });
+    const mediaFileInput = el('input', {
+      id: 'admin-ev-media-file',
+      type: 'file',
+      name: 'media_file',
+      accept: 'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm',
+      className: 'form-control'
+    });
+    const postingInput = el('textarea', {
+      id: 'admin-ev-posting',
+      rows: '3',
+      name: 'posting_contenido',
+      className: 'form-control',
+      placeholder: 'Texto editorial o anuncio del posting (visible sin tarjetas)...'
+    });
+    postingInput.value = editingEv?.posting_contenido || '';
+
+    const livePreviewHost = el('div', { id: 'admin-event-live-preview', style: { marginTop: '1rem' } });
+
+    function refreshLiveEventPreview() {
+      clearContainer(livePreviewHost);
+      const selectedFile = mediaFileInput.files?.[0];
+      const draftEvent = {
+        id: editingEv?.id || 0,
+        titulo: tituloInput.value.trim() || 'Título del evento',
+        descripcion: descInput.value.trim() || 'Descripción breve del evento.',
+        tipo: tipoSelect.value,
+        porcentaje_descuento: Number(dtoInput.value || 0),
+        cupo_maximo: cupoInput.value ? Number(cupoInput.value) : null,
+        cupos_restantes: cupoInput.value ? Number(cupoInput.value) : null,
+        premio_sorteo: premioInput.value.trim() || null,
+        estado: editingEv?.estado || 'ACTIVO',
+        media_tipo: mediaTipoSelect.value,
+        media_url: selectedFile ? null : mediaUrlInput.value.trim() || null,
+        posting_contenido: postingInput.value.trim() || null
+      };
+
+      livePreviewHost.appendChild(
+        el('p', { style: { fontSize: '0.82rem', fontWeight: '700', color: 'var(--text-muted)', marginBottom: '0.4rem' } }, 'Vista previa en vivo (sin tarjetas):')
+      );
+      livePreviewHost.appendChild(renderCardlessEventsShowcase([draftEvent], { mode: 'admin-preview' }));
+
+      if (selectedFile && activeEventPreviewUrl) {
+        const isVideo = selectedFile.type.startsWith('video/');
+        livePreviewHost.appendChild(
+          el('div', { style: { marginTop: '0.5rem' } }, [
+            isVideo
+              ? el('video', { className: 'event-media-video', src: activeEventPreviewUrl, controls: 'true', preload: 'metadata' })
+              : el('img', { className: 'event-posting-img', src: activeEventPreviewUrl, alt: draftEvent.titulo })
+          ])
+        );
+      }
+    }
+
+    mediaFileInput.addEventListener('change', () => {
+      const file = mediaFileInput.files?.[0];
+      if (!file) {
+        revokeEventPreviewUrl();
+        refreshLiveEventPreview();
+        return;
+      }
+      const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'video/mp4', 'video/webm'];
+      if (!allowed.includes(file.type)) {
+        mediaFileInput.value = '';
+        showNotification('Archivo no permitido. Usa PNG/JPG/WEBP/GIF o MP4/WEBM.', 'error');
+        return;
+      }
+      if (file.size > 15 * 1024 * 1024) {
+        mediaFileInput.value = '';
+        showNotification('El archivo multimedia supera el máximo de 15 MB.', 'error');
+        return;
+      }
+      revokeEventPreviewUrl();
+      activeEventPreviewUrl = URL.createObjectURL(file);
+      if (mediaTipoSelect.value === 'NONE') {
+        mediaTipoSelect.value = file.type.startsWith('video/') ? 'VIDEO' : 'POSTING';
+      }
+      refreshLiveEventPreview();
+    });
+
+    for (const inputNode of [tituloInput, descInput, tipoSelect, dtoInput, cupoInput, premioInput, mediaTipoSelect, mediaUrlInput, postingInput]) {
+      inputNode.addEventListener('input', refreshLiveEventPreview);
+      inputNode.addEventListener('change', refreshLiveEventPreview);
+    }
 
     const evForm = el(
       'form',
@@ -2098,21 +2478,48 @@ function drawActiveAdminTab(container) {
           try {
             const now = new Date();
             const end = new Date(now.getTime() + 14 * 86400000);
-            const res = await apiRequest('/events', {
-              method: 'POST',
-              body: {
+            const path = editingEv ? `/events/${editingEv.id}` : '/events';
+            const method = editingEv ? 'PUT' : 'POST';
+            const selectedFile = mediaFileInput.files?.[0];
+
+            let requestBody;
+            if (selectedFile) {
+              const fd = new FormData();
+              fd.append('titulo', tituloInput.value.trim());
+              fd.append('descripcion', descInput.value.trim());
+              fd.append('tipo', tipoSelect.value);
+              fd.append('porcentaje_descuento', String(Number(dtoInput.value || 0)));
+              if (cupoInput.value) fd.append('cupo_maximo', String(Number(cupoInput.value)));
+              if (premioInput.value.trim()) fd.append('premio_sorteo', premioInput.value.trim());
+              fd.append('fecha_inicio', editingEv?.fecha_inicio || now.toISOString());
+              fd.append('fecha_fin', editingEv?.fecha_fin || end.toISOString());
+              fd.append('media_tipo', mediaTipoSelect.value);
+              if (mediaUrlInput.value.trim()) fd.append('media_url', mediaUrlInput.value.trim());
+              if (postingInput.value.trim()) fd.append('posting_contenido', postingInput.value.trim());
+              fd.append('media_file', selectedFile);
+              requestBody = fd;
+            } else {
+              requestBody = {
                 titulo: tituloInput.value.trim(),
                 descripcion: descInput.value.trim(),
                 tipo: tipoSelect.value,
                 porcentaje_descuento: Number(dtoInput.value || 0),
                 cupo_maximo: cupoInput.value ? Number(cupoInput.value) : null,
                 premio_sorteo: premioInput.value.trim() || null,
-                fecha_inicio: now.toISOString(),
-                fecha_fin: end.toISOString()
-              }
+                fecha_inicio: editingEv?.fecha_inicio || now.toISOString(),
+                fecha_fin: editingEv?.fecha_fin || end.toISOString(),
+                media_tipo: mediaTipoSelect.value,
+                media_url: mediaUrlInput.value.trim() || null,
+                posting_contenido: postingInput.value.trim() || null
+              };
+            }
+
+            const res = await apiRequest(path, {
+              method,
+              body: requestBody
             });
-            tituloInput.value = '';
-            descInput.value = '';
+            revokeEventPreviewUrl();
+            appState.editingEvent = null;
             showNotification(res.message, 'success');
             await loadAdminData();
             drawActiveAdminTab(container);
@@ -2123,25 +2530,83 @@ function drawActiveAdminTab(container) {
       },
       [
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Título del Evento o Promoción'),
+          el('label', { className: 'form-label', for: 'admin-ev-titulo' }, 'Título del Evento o Promoción'),
           tituloInput
         ]),
-        el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Descripción'), descInput]),
-        el('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.6rem' } }, [
-          el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Tipo'), tipoSelect]),
-          el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, '% Descuento'), dtoInput]),
-          el('div', { className: 'form-group' }, [el('label', { className: 'form-label' }, 'Cupo Máx.'), cupoInput])
+        el('div', { className: 'form-group' }, [
+          el('label', { className: 'form-label', for: 'admin-ev-descripcion' }, 'Descripción'),
+          descInput
+        ]),
+        el('div', { className: 'form-row-3' }, [
+          el('div', { className: 'form-group' }, [
+            el('label', { className: 'form-label', for: 'admin-ev-tipo' }, 'Tipo'),
+            tipoSelect
+          ]),
+          el('div', { className: 'form-group' }, [
+            el('label', { className: 'form-label', for: 'admin-ev-descuento' }, '% Descuento'),
+            dtoInput
+          ]),
+          el('div', { className: 'form-group' }, [
+            el('label', { className: 'form-label', for: 'admin-ev-cupo' }, 'Cupo Máx.'),
+            cupoInput
+          ])
         ]),
         el('div', { className: 'form-group' }, [
-          el('label', { className: 'form-label' }, 'Premio del Sorteo (Opcional)'),
+          el('label', { className: 'form-label', for: 'admin-ev-premio' }, 'Premio del Sorteo (Opcional)'),
           premioInput
         ]),
-        el('button', { type: 'submit', className: 'btn btn-primary' }, 'Publicar Evento / Promoción')
+        el('div', { className: 'form-row-2' }, [
+          el('div', { className: 'form-group' }, [
+            el('label', { className: 'form-label', for: 'admin-ev-media-tipo' }, 'Formato Multimedia'),
+            mediaTipoSelect
+          ]),
+          el('div', { className: 'form-group' }, [
+            el('label', { className: 'form-label', for: 'admin-ev-media-url' }, 'URL de Video o Imagen'),
+            mediaUrlInput
+          ])
+        ]),
+        el('div', { className: 'form-group' }, [
+          el(
+            'label',
+            { className: 'form-label', for: 'admin-ev-media-file' },
+            'Subir Archivo Multimedia (Imagen o MP4/WEBM · Máx 15 MB)'
+          ),
+          mediaFileInput
+        ]),
+        el('div', { className: 'form-group' }, [
+          el('label', { className: 'form-label', for: 'admin-ev-posting' }, 'Contenido del Posting (Cita o Anuncio)'),
+          postingInput
+        ]),
+        el('div', { style: { display: 'flex', gap: '0.6rem', flexWrap: 'wrap' } }, [
+          el(
+            'button',
+            { type: 'submit', className: 'btn btn-primary' },
+            editingEv ? 'Guardar Cambios del Evento' : 'Publicar Evento / Promoción'
+          ),
+          editingEv
+            ? el(
+                'button',
+                {
+                  type: 'button',
+                  className: 'btn btn-outline',
+                  onClick: () => {
+                    revokeEventPreviewUrl();
+                    appState.editingEvent = null;
+                    drawActiveAdminTab(container);
+                  }
+                },
+                'Cancelar Edición'
+              )
+            : null
+        ]),
+        livePreviewHost
       ]
     );
+    refreshLiveEventPreview();
 
     const eventsList = el('div', { className: 'card-body' }, [el('h3', {}, 'Eventos y Sorteos Registrados')]);
     for (const ev of appState.events) {
+      const nextEstado = ev.estado === 'ACTIVO' ? 'CANCELADO' : 'ACTIVO';
       eventsList.appendChild(
         el(
           'div',
@@ -2151,7 +2616,9 @@ function drawActiveAdminTab(container) {
               borderBottom: '1px solid var(--border-subtle)',
               display: 'flex',
               justifyContent: 'space-between',
-              alignItems: 'center'
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: '0.5rem'
             }
           },
           [
@@ -2160,10 +2627,45 @@ function drawActiveAdminTab(container) {
               el(
                 'div',
                 { style: { fontSize: '0.82rem', color: 'var(--text-muted)' } },
-                `${ev.tipo} · Inscritos: ${ev.total_inscritos}`
+                `${ev.tipo} · ${ev.media_tipo || 'NONE'} · Inscritos: ${ev.total_inscritos || 0}`
               )
             ]),
-            el('span', { className: `badge badge-${ev.estado}` }, ev.estado)
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' } }, [
+              el('span', { className: `badge badge-${ev.estado}` }, ev.estado),
+              el(
+                'button',
+                {
+                  type: 'button',
+                  className: 'btn btn-outline btn-sm',
+                  onClick: () => {
+                    appState.editingEvent = ev;
+                    drawActiveAdminTab(container);
+                  }
+                },
+                'Editar'
+              ),
+              el(
+                'button',
+                {
+                  type: 'button',
+                  className: 'btn btn-outline btn-sm',
+                  onClick: async () => {
+                    try {
+                      const res = await apiRequest(`/events/${ev.id}/status`, {
+                        method: 'PATCH',
+                        body: { estado: nextEstado }
+                      });
+                      showNotification(res.message, 'success');
+                      await loadAdminData();
+                      drawActiveAdminTab(container);
+                    } catch (err) {
+                      showNotification(err.message, 'error');
+                    }
+                  }
+                },
+                ev.estado === 'ACTIVO' ? 'Cancelar' : 'Reactivar'
+              )
+            ])
           ]
         )
       );
@@ -2178,18 +2680,21 @@ function drawActiveAdminTab(container) {
           'div',
           { style: { padding: '0.7rem 0', borderBottom: '1px solid var(--border-subtle)' } },
           [
-            el('div', { style: { display: 'flex', justifyContent: 'space-between' } }, [
-              el('strong', {}, rec.nombre_sugerido),
-              el('span', { className: `badge badge-${rec.estado}` }, rec.estado)
-            ]),
+            el(
+              'div',
+              { style: { display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.4rem' } },
+              [
+                el('strong', {}, rec.nombre_sugerido),
+                el('span', { className: `badge badge-${rec.estado}` }, rec.estado)
+              ]
+            ),
             el('p', { style: { fontSize: '0.86rem', color: 'var(--text-muted)', margin: '0.25rem 0' } }, rec.descripcion_ingredientes),
-            el('div', { style: { display: 'flex', gap: '0.4rem', marginTop: '0.35rem' } }, [
+            el('div', { style: { display: 'flex', gap: '0.4rem', flexWrap: 'wrap', marginTop: '0.35rem' } }, [
               el(
                 'button',
                 {
                   type: 'button',
-                  className: 'btn btn-outline',
-                  style: { padding: '0.2rem 0.55rem', fontSize: '0.78rem' },
+                  className: 'btn btn-outline btn-sm',
                   onClick: async () => {
                     const res = await apiRequest(`/recommendations/${rec.id}/status`, {
                       method: 'PATCH',
@@ -2206,8 +2711,7 @@ function drawActiveAdminTab(container) {
                 'button',
                 {
                   type: 'button',
-                  className: 'btn btn-outline',
-                  style: { padding: '0.2rem 0.55rem', fontSize: '0.78rem' },
+                  className: 'btn btn-outline btn-sm',
                   onClick: async () => {
                     const res = await apiRequest(`/recommendations/${rec.id}/status`, {
                       method: 'PATCH',
@@ -2230,7 +2734,11 @@ function drawActiveAdminTab(container) {
       el('div', { className: 'grid-2' }, [
         el('div', { className: 'card' }, [
           el('div', { className: 'card-body' }, [
-            el('h3', { style: { color: 'var(--color-primary)' } }, 'Registrar Nuevo Evento, Promoción o Sorteo'),
+            el(
+              'h3',
+              { style: { color: 'var(--color-primary)' } },
+              editingEv ? `Editar Evento #${editingEv.id}` : 'Registrar Nuevo Evento, Promoción o Sorteo'
+            ),
             evForm
           ])
         ]),
@@ -2238,6 +2746,13 @@ function drawActiveAdminTab(container) {
           el('div', { className: 'card', style: { marginBottom: '1.35rem' } }, [eventsList]),
           el('div', { className: 'card' }, [recsList])
         ])
+      ])
+    );
+
+    container.appendChild(
+      el('section', { style: { marginTop: '2rem' } }, [
+        el('h3', { style: { marginBottom: '0.65rem' } }, 'Vista Pública de Eventos (Sin Tarjetas)'),
+        renderCardlessEventsShowcase(appState.events, { mode: 'admin-preview' })
       ])
     );
   }
@@ -2253,20 +2768,33 @@ function handleRouteChange() {
   const root = document.getElementById('app-root');
   if (!root) return;
 
+  closeMobileNav();
+  revokeAllAdminPreviewUrls();
+
   if (['quienes-somos', 'catalogo', 'eventos', 'contacto'].includes(hash)) {
-    if (appState.route !== 'home') {
+    if (appState.route !== 'home' || !root.hasChildNodes()) {
       appState.route = 'home';
       renderNavbar();
       renderHomeView(root).then(() => {
+        if (hash === 'eventos' && typeof homeTabSyncHandler === 'function') {
+          homeTabSyncHandler('eventos');
+        }
         const target = document.getElementById(hash);
         if (target) target.scrollIntoView({ behavior: 'smooth' });
       });
     } else {
+      if (hash === 'eventos' && typeof homeTabSyncHandler === 'function') {
+        homeTabSyncHandler('eventos');
+      }
       const target = document.getElementById(hash);
       if (target) target.scrollIntoView({ behavior: 'smooth' });
     }
     return;
   }
+
+  activeBurgerController?.destroy();
+  activeBurgerController = null;
+  homeTabSyncHandler = null;
 
   appState.route = hash || 'home';
   renderNavbar();
